@@ -1,5 +1,5 @@
 """
-This file containce an implementation of WARP alignment method presented in
+This file contain an implementation of WARP alignment method presented in
 the following article https://arxiv.org/pdf/2406.16768
 """
 
@@ -17,8 +17,7 @@ from transformers import (
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizer,
-    pipeline,
-    sentime
+    pipeline
 )
 
 from datasets import Dataset, load_metric
@@ -27,7 +26,7 @@ class WARPTrainer:
     """
     WARP Trainer implementation class
     """
-    def __init__(self, 
+    def __init__(self,
                  config: WARPConfig,
                  model: PreTrainedModel,
                  tokenizer: PreTrainedTokenizer,
@@ -88,17 +87,15 @@ class WARPTrainer:
     def _generate(self, 
                   model: PreTrainedModel, 
                   tokenizer: PreTrainedTokenizer,
-                  promts: List[str],
+                  encoded_promts: torch.Tensor,
                   generation_config: GenerationConfig,
-                  pad_token_id) -> Tuple[List[str], torch.Tensor, torch.FloatTensor]:
+                  pad_token_id) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-
-            encoded_promts = tokenizer(promts, padding=True, truncation=True, return_tensors="pt")
-            outputs = model.generate(imputs=encoded_promts['input_ids'], 
+            outputs = model.generate(imputs=encoded_promts, 
                                     generation_config=generation_config,
                                     attention_mask=encoded_promts != pad_token_id)
-            
-            decoded_responses = [tokenizer.decode(ids, skip_special_tokens=True) for ids in outputs['sequences']]
+
+            decoded_responses: List[str] = [tokenizer.decode(ids, skip_special_tokens=True) for ids in outputs['sequences']]
             encoded_responses: torch.Tensor = outputs['sequences']
             logitss = torch.stack(outputs['logits'], 1)
 
@@ -111,6 +108,9 @@ class WARPTrainer:
         pass
 
     def train(self):
+        """
+        Main function that trains model using WARP method
+        """
         config = self.config
 
         generation_config = GenerationConfig(
@@ -124,13 +124,8 @@ class WARPTrainer:
 
         model_init = copy.deepcopy(self.model)
 
-        def repeat_generator():
-            while True:
-                yield from self.train_dataloader
-
-        iter_dataloader = iter(repeat_generator())        
-
         for _ in range(config.iterations):
+            
             rl_models = []
             for _ in range(config.rl_runs):
 
@@ -139,26 +134,29 @@ class WARPTrainer:
 
                 optimizer = Adam(model_m.parameters())
 
-                for t in range(config.training_steps):
+                for _ in range(config.training_steps):
+
+                    inputs = next(iter(self.train_dataloader))['input_ids']
+
                     decoded_responses_m, encoded_responses_m, logitss_m = self._generate(
                         model=model_m,
                         tokenizer=self.tokenizer,
-                        promts=data,
+                        encoded_promts=inputs,
                         generation_config=generation_config,
                         pad_token_id=model_m.config.pad_token_id
                     )
         
                     _, encoded_responses_ema, logits_ema = self._generate(
                         model=model_ema, 
-                        okenizer=self.tokenizer,
-                        promts=data,
+                        tokenizer=self.tokenizer,
+                        encoded_promts=inputs,
                         generation_config=generation_config,
                         pad_token_id=model_ema.config.pad_token_id)
                     
                     logprobs_m = torch.log_softmax(logitss_m, dim=-1)
 
                     pol_logprobs_m = self._process_logitss(encoded_responses_m, logitss_m)
-                    pol_logprobs_ema = self._process_logitss(encoded_responses_m, logitss_m)
+                    pol_logprobs_ema = self._process_logitss(encoded_responses_ema, logits_ema)
 
                     kl = pol_logprobs_m - pol_logprobs_ema
                     non_score_reward = (-config.kl_penalty * kl).sum(1)
@@ -182,3 +180,7 @@ class WARPTrainer:
                 for model_init_param, model_slerp_param in zip(model_init.parameters(), model_slerp.parameters()):
                     eta = config.liti_update_rate
                     model_init_param.data = (1 - eta) * model_init_param.data + eta * model_slerp_param.data
+
+        with torch.no_grad():
+            for model_param, model_init in zip(model_init.parameters(), model_slerp.parameters()):
+                model_param.data = model_init.data
