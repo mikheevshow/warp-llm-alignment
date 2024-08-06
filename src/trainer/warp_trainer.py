@@ -13,6 +13,9 @@ from torch.utils.data import (
 from torch.optim import Adam
 
 from warp_config import WARPConfig
+
+from accelerate import Accelerator
+
 from transformers import (
     GenerationConfig,
     PreTrainedModel,
@@ -54,6 +57,9 @@ class WARPTrainer:
             dataset=eval_dataset
         )
 
+        self.accelerator = Accelerator()
+        self.device = self.accelerator.device
+
     def _get_generation_score(self, responses: List[str]) -> torch.FloatTensor:
         """
         Generates scores of provided texts
@@ -89,8 +95,9 @@ class WARPTrainer:
                   tokenizer: PreTrainedTokenizer,
                   encoded_promts: torch.Tensor,
                   generation_config: GenerationConfig,
+                  enable_grad: bool,
                   pad_token_id) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
-        with torch.no_grad():
+        with torch.set_grad_enabled(enable_grad):
             outputs = model.generate(imputs=encoded_promts, 
                                     generation_config=generation_config,
                                     attention_mask=encoded_promts != pad_token_id)
@@ -129,49 +136,62 @@ class WARPTrainer:
             rl_models = []
             for _ in range(config.rl_runs):
 
-                model_m = copy.deepcopy(model_init)
-                model_ema = copy.deepcopy(model_init)
+                model_m = copy.deepcopy(model_init).to(self.accelerator.device)
+                model_ema = copy.deepcopy(model_init).to(self.accelerator.device)
+                optimizer = Adam(model_m.parameters(), lr=config.learning_rate)
+                
+                model_m, optimizer, train_dataloader = self.accelerator.prepare(model_m, optimizer, self.train_dataloader)
 
-                optimizer = Adam(model_m.parameters())
-
+                model_m.train()
                 for _ in range(config.training_steps):
 
-                    inputs = next(iter(self.train_dataloader))['input_ids']
+                    inputs = next(iter(train_dataloader))['input_ids'].to(self.accelerator.device)
+
+                    optimizer.zero_grad()
 
                     decoded_responses_m, encoded_responses_m, logitss_m = self._generate(
                         model=model_m,
                         tokenizer=self.tokenizer,
                         encoded_promts=inputs,
                         generation_config=generation_config,
+                        enable_grad=True,
                         pad_token_id=model_m.config.pad_token_id
                     )
         
                     _, encoded_responses_ema, logits_ema = self._generate(
-                        model=model_ema, 
+                        model=model_ema,
                         tokenizer=self.tokenizer,
                         encoded_promts=inputs,
                         generation_config=generation_config,
+                        enable_grad=False,
                         pad_token_id=model_ema.config.pad_token_id)
+                    
+                    del inputs
                     
                     logprobs_m = torch.log_softmax(logitss_m, dim=-1)
 
-                    pol_logprobs_m = self._process_logitss(encoded_responses_m, logitss_m)
-                    pol_logprobs_ema = self._process_logitss(encoded_responses_ema, logits_ema)
+                    pol_logprobs_m = self._process_logitss(encoded_responses_m, logitss_m).detach()
+                    pol_logprobs_ema = self._process_logitss(encoded_responses_ema, logits_ema).detach()
 
                     kl = pol_logprobs_m - pol_logprobs_ema
                     non_score_reward = (-config.kl_penalty * kl).sum(1)
                     rewards_of_generated_texts = self._get_generation_score(decoded_responses_m)
                     total_reward = (rewards_of_generated_texts + non_score_reward).unsqueeze(-1).unsqueeze(-1)
 
+                    del pol_logprobs_m, pol_logprobs_ema, kl, non_score_reward, rewards_of_generated_texts
+
                     loss = (total_reward * logprobs_m).mean()
-                    optimizer.zero_grad()
-                    loss.backward()
+
+                    print("loss is")
+                    print(loss)
+
+                    self.accelerator.backward(loss)
                     optimizer.step()
 
                     with torch.no_grad():
                         for model_m_ema_param, model_m_param in zip(model_ema.parameters(), model_m.parameters()):
                             mu = config.ema_update_rate
-                            model_m_ema_param.data = (1 - mu) * model_m_ema_param.data + mu * model_m_param.data
+                            model_m_ema_param.data = (1 - mu) * model_m_ema_param.data + mu * model_m_param.data          
 
             rl_models.append(model_m)
 
