@@ -60,8 +60,8 @@ def create_train_reward_model(publish: bool = False, proportion_of_train: float 
     """
     Train reward model 
     """
-    assert proportion_of_train > 0.0 and proportion_of_train < 1.0
-    assert proportion_of_eval > 0.0 and proportion_of_eval < 1.0
+    assert proportion_of_train > 0.0 and proportion_of_train <= 1.0
+    assert proportion_of_eval > 0.0 and proportion_of_eval <= 1.0
 
     # Prepare train and evaluation datasets
     print(f"Loading {DATASET_NAME} dataset")

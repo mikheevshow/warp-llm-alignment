@@ -6,6 +6,8 @@ the following article https://arxiv.org/pdf/2406.16768
 import copy
 import torch
 
+from tqdm import tqdm
+
 from typing import List, Tuple
 from torch.utils.data import (
     DataLoader
@@ -131,10 +133,12 @@ class WARPTrainer:
 
         model_init = copy.deepcopy(self.model)
 
-        for _ in range(config.iterations):
+        for i in range(config.iterations):
             
             rl_models = []
-            for _ in range(config.rl_runs):
+            for m in range(config.rl_runs):
+                
+                print(f"Start rl step {m}...")
 
                 model_m = copy.deepcopy(model_init).to(self.accelerator.device)
                 model_ema = copy.deepcopy(model_init).to(self.accelerator.device)
@@ -143,7 +147,7 @@ class WARPTrainer:
                 model_m, optimizer, train_dataloader = self.accelerator.prepare(model_m, optimizer, self.train_dataloader)
 
                 model_m.train()
-                for _ in range(config.training_steps):
+                for _ in tqdm(range(config.training_steps)):
 
                     inputs = next(iter(train_dataloader))['input_ids'].to(self.accelerator.device)
 
@@ -193,9 +197,12 @@ class WARPTrainer:
                             mu = config.ema_update_rate
                             model_m_ema_param.data = (1 - mu) * model_m_ema_param.data + mu * model_m_param.data          
 
-            rl_models.append(model_m)
+                rl_models.append(model_m)
 
+            print(f"Start SLERP averaging iteration {i}...")
             model_slerp = self._slerp(model=model_init, models=rl_models, l=1/len(rl_models))
+            print(f"Finish SLERP averaging iteration {i}...")
+
             with torch.no_grad():
                 for model_init_param, model_slerp_param in zip(model_init.parameters(), model_slerp.parameters()):
                     eta = config.liti_update_rate
